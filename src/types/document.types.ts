@@ -1,0 +1,136 @@
+// ============================================================
+// Document Generation Types
+// Defines the JSON structure that AI returns and docx builder consumes
+// ============================================================
+
+/**
+ * Supported section content types
+ */
+export type SectionType =
+    | 'heading'
+    | 'paragraph'
+    | 'bullet_list'
+    | 'numbered_list'
+    | 'table'
+    | 'table_of_contents'
+    | 'horizontal_rule'
+    | 'blockquote'
+    | 'two_column'
+    | 'callout'
+    | 'section_block'
+    | 'references';
+
+/**
+ * Text run with optional formatting
+ */
+export interface TextRunData {
+    text: string;
+    bold?: boolean;
+    italic?: boolean;
+    underline?: boolean;
+    fontSize?: number;      // in half-points (24 = 12pt)
+    font?: string;
+    color?: string;         // hex without #, e.g. "FF0000"
+    hyperlink?: string;     // URL for hyperlinks
+}
+
+/**
+ * Table cell data
+ */
+export interface TableCellData {
+    text: string;
+    bold?: boolean;
+    shading?: string;       // hex fill color without #
+}
+
+/**
+ * Table row data
+ */
+export interface TableRowData {
+    cells: TableCellData[];
+    isHeader?: boolean;
+}
+
+/**
+ * A single section of the document
+ */
+export interface DocumentSection {
+    type: SectionType;
+    level?: number;             // For headings: 1, 2, or 3
+    content?: string;           // For heading/paragraph/blockquote/callout text
+    textRuns?: TextRunData[];   // For rich text paragraphs
+    items?: string[];           // For bullet_list/numbered_list
+    rows?: TableRowData[];      // For tables
+    columnWidths?: number[];    // For tables (DXA units)
+    pageBreakBefore?: boolean;  // Insert page break before this section
+    alignment?: 'left' | 'center' | 'right' | 'justified'; // Text alignment
+    spacing?: { before?: number; after?: number }; // Spacing in DXA
+    tocTitle?: string;          // Custom title for table_of_contents (default: "Table of Contents")
+
+    // For two_column or section_block: child sections
+    sections?: DocumentSection[];
+    columnGap?: number;         // For two_column: gap between columns in DXA (default: 720 = 0.5 inch)
+
+    // For callout/section_block styling
+    backgroundColor?: string;   // hex without #
+    borderColor?: string;       // hex without #
+}
+
+/**
+ * Color theme for the document
+ */
+export interface DocumentTheme {
+    headingColor: string;       // hex without #, e.g. "CC0000" for red
+    subHeadingColor: string;    // hex without #
+    accentColor: string;        // hex without # - used for table headers, highlights
+    textColor?: string;         // hex without # - default "333333"
+    fontFamily?: string;        // e.g. "Arial", "Calibri", "Times New Roman" - default "Arial"
+}
+
+/**
+ * Full document structure returned by AI
+ */
+export interface DocumentStructure {
+    title: string;
+    fileName: string;
+    sections: DocumentSection[];
+    theme?: DocumentTheme;
+    pageSize?: {
+        width: number;      // DXA (default: 12240 = US Letter)
+        height: number;     // DXA (default: 15840 = US Letter)
+    };
+    margins?: {
+        top: number;        // DXA (default: 1440 = 1 inch)
+        right: number;
+        bottom: number;
+        left: number;
+    };
+    headerFooter?: {
+        headerLeft?: string;
+        headerCenter?: string;
+        headerRight?: string;
+        footerLeft?: string;
+        footerCenter?: string;
+        footerRight?: string; // e.g. "Page {page}" or just text
+    };
+}
+
+/**
+ * API request body for document generation
+ */
+export interface GenerateDocRequest {
+    prompt?: string;            // Optional: if omitted, synthesized from conversationId
+    documentType?: string;      // e.g. "proposal", "report", "letter", "resume"
+    template?: 'generic' | 'academic';  // which skills template to use (default: "generic")
+    conversationId?: string;    // Required for chat-based flow (prompt will be synthesized)
+    intent?: 'create' | 'edit'; // "edit" attaches latest doc JSON for modification
+}
+
+/**
+ * API response for document generation
+ */
+export interface GenerateDocResponse {
+    success: boolean;
+    message: string;
+    fileName?: string;
+}
