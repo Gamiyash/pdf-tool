@@ -7,7 +7,7 @@ import { AppError } from '../middleware/error.middleware';
  * Supported document templates.
  * Each template maps to a skills .md file in src/skills/
  */
-export type DocumentTemplate = 'generic' | 'academic';
+export type DocumentTemplate = 'generic' | 'academic' | 'generic_edit' | 'academic_edit';
 
 /**
  * Template → skills file mapping
@@ -15,6 +15,8 @@ export type DocumentTemplate = 'generic' | 'academic';
 const TEMPLATE_FILES: Record<DocumentTemplate, string> = {
     generic: 'doc_skills.md',
     academic: 'academic_skills.md',
+    generic_edit: 'doc_edit_skills.md',
+    academic_edit: 'academic_edit_skills.md',
 };
 
 const SKILLS_DIR = path.join(__dirname, '../skills');

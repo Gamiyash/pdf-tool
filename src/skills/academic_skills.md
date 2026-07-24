@@ -102,26 +102,25 @@ If the user requests a specific font or colors, use their choices. Otherwise, us
 "theme": { "headingColor": "1A1A2E", "subHeadingColor": "16213E", "accentColor": "D5E8F0", "textColor": "212121", "fontFamily": "Times New Roman" }
 ```
 
-### Heading Alignment (STRICT RULE — ALL HEADINGS MUST BE CENTER-ALIGNED)
-Academic documents ALWAYS use center-aligned headings (H1, H2, H3) unless the user explicitly requests left alignment.
+### Heading Alignment (STRICT RULE)
+Academic documents use center-alignment ONLY for main chapter/section headings (H1). Subheadings (H2, H3) MUST ALWAYS be left-aligned.
 
-Every heading section MUST include `"alignment": "center"`:
-```json
+Every heading section MUST strictly follow these alignment rules based on its level:
+
 { "type": "heading", "level": 1, "content": "Chapter 1: Introduction", "alignment": "center" }
-{ "type": "heading", "level": 2, "content": "1.1 Background", "alignment": "center" }
-{ "type": "heading", "level": 3, "content": "1.1.1 Context", "alignment": "center" }
-```
+{ "type": "heading", "level": 2, "content": "1.1 Background", "alignment": "left" }
+{ "type": "heading", "level": 3, "content": "1.1.1 Context", "alignment": "left" }
 
-❌ WRONG — missing alignment:
+❌ WRONG — missing alignment or centering a subheading:
 ```json
 { "type": "heading", "level": 1, "content": "Chapter 1: Introduction" }
 ```
-✅ CORRECT — with alignment:
-```json
-{ "type": "heading", "level": 1, "content": "Chapter 1: Introduction", "alignment": "center" }
-```
+✅ CORRECT — H1 center, H2/H3 left:
 
-> **Override:** If the user explicitly says "left-align headings" or "left aligned", use `"alignment": "left"` instead.
+{ "type": "heading", "level": 1, "content": "Chapter 1: Introduction", "alignment": "center" }
+{ "type": "heading", "level": 2, "content": "1.1 Background", "alignment": "left" }
+
+> **Override:** If the user explicitly says "center all headings" use `"alignment": "center"` everywhere.
 
 ### Font Sizes (enforced by engine — your values are overridden)
 | Element | Half-points | Points |

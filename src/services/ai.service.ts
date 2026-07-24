@@ -1,5 +1,5 @@
 import { getGeminiModel } from '../config/gemini.config';
-import { DocumentStructure, DocumentSection } from '../types/document.types';
+import { DocumentStructure, DocumentSection, EditDocumentResult } from '../types/document.types';
 import { loggerUtil } from '../utils/logger.util';
 import { AppError } from '../middleware/error.middleware';
 import { loadSkills, DocumentTemplate } from '../utils/skills-loader.util';
@@ -82,6 +82,15 @@ You are an expert document creation AI. You return ONLY valid JSON — no code, 
 
 export interface GeneratedDocumentResult {
     structure: DocumentStructure;
+    usageMetadata?: {
+        promptTokens: number;
+        completionTokens: number;
+        totalTokens: number;
+    };
+}
+
+export interface GeneratedEditResult {
+    editResult: EditDocumentResult;
     usageMetadata?: {
         promptTokens: number;
         completionTokens: number;
@@ -220,6 +229,132 @@ Generate the document following ALL rules from the knowledge base. Return ONLY v
             }
 
             throw new AppError(500, 'Failed to generate document structure from AI');
+        }
+    }
+
+    /**
+     * Edit an existing document — returns only changed/new sections.
+     *
+     * Uses the short edit skill file to save tokens.
+     * Returns EditDocumentResult (updatedSections + deletedIds).
+     */
+    async editDocumentStructure(
+        prompt: string,
+        template: 'generic' | 'academic' = 'generic'
+    ): Promise<GeneratedEditResult> {
+        try {
+            const model = getGeminiModel();
+            const editTemplate: DocumentTemplate = `${template}_edit`;
+            const skills = loadSkills(editTemplate);
+
+            loggerUtil.info('Sending edit prompt to Gemini AI', {
+                promptLength: prompt.length,
+                template: editTemplate,
+            });
+
+            const fullPrompt = `=== DOCUMENT EDIT KNOWLEDGE BASE (${template.toUpperCase()} TEMPLATE) ===
+
+${skills}
+
+=== END KNOWLEDGE BASE ===
+
+=== EDIT TASK ===
+
+${prompt}
+
+Return ONLY valid JSON matching the edit format: { "updatedSections": [...], "deletedIds": [...] }`;
+
+            const MAX_RETRIES = 3;
+            let result: any;
+
+            for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+                try {
+                    result = await model.generateContent({
+                        contents: [
+                            {
+                                role: 'user',
+                                parts: [{ text: fullPrompt }],
+                            },
+                        ],
+                        generationConfig: {
+                            temperature: 0.5,
+                            maxOutputTokens: 65536,
+                            responseMimeType: 'application/json',
+                        },
+                    });
+                    break;
+                } catch (err: any) {
+                    const isRetryable = err?.message?.includes('503') || err?.message?.includes('429');
+                    if (isRetryable && attempt < MAX_RETRIES) {
+                        const delayMs = 1000 * Math.pow(2, attempt - 1);
+                        loggerUtil.warn(`Gemini transient error on edit attempt ${attempt}/${MAX_RETRIES}, retrying in ${delayMs}ms`, {
+                            error: err.message
+                        });
+                        await new Promise(resolve => setTimeout(resolve, delayMs));
+                    } else {
+                        throw err;
+                    }
+                }
+            }
+
+            const response = result.response;
+            const text = response.text();
+
+            loggerUtil.info('Raw AI edit response received', {
+                responseLength: text.length,
+                finishReason: response.candidates?.[0]?.finishReason || 'unknown',
+            });
+            // LOG FULL RAW TEXT for debugging (trim to 5000 chars to avoid log bloat)
+            loggerUtil.info('RAW EDIT AI RESPONSE TEXT', {
+                rawText: text.substring(0, 5000),
+            });
+
+            // Parse edit response
+            let cleaned = text.trim();
+            cleaned = cleaned.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
+            const parsed = JSON.parse(cleaned);
+
+            const editResult: EditDocumentResult = {
+                updatedSections: Array.isArray(parsed.updatedSections)
+                    ? this.normalizeSections(parsed.updatedSections)
+                    : [],
+                deletedIds: Array.isArray(parsed.deletedIds) ? parsed.deletedIds : undefined,
+            };
+
+            loggerUtil.info('Edit result parsed', {
+                updatedCount: editResult.updatedSections.length,
+                deletedCount: editResult.deletedIds?.length || 0,
+                deletedIds: editResult.deletedIds || [],
+                updatedSections: editResult.updatedSections.map(s => ({
+                    id: s.id || '(no id — new section)',
+                    afterId: s.afterId || '(no afterId — append at end)',
+                    type: s.type,
+                    content: (s.content || '').substring(0, 80),
+                })),
+            });
+
+            const usage = response.usageMetadata;
+
+            return {
+                editResult,
+                usageMetadata: usage ? {
+                    promptTokens: usage.promptTokenCount,
+                    completionTokens: usage.candidatesTokenCount,
+                    totalTokens: usage.totalTokenCount,
+                } : undefined
+            };
+
+        } catch (error) {
+            loggerUtil.error('AI document edit failed', error as Error);
+
+            if (error instanceof AppError) throw error;
+
+            const errMsg = (error as any)?.message || '';
+            if (errMsg.includes('503') || errMsg.includes('high demand')) {
+                throw new AppError(503, 'AI service is temporarily busy. Please try again in a moment.');
+            }
+
+            throw new AppError(500, 'Failed to edit document structure from AI');
         }
     }
 
