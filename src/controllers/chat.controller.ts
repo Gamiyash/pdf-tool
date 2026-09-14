@@ -27,7 +27,7 @@ export class ChatController {
      */
     sendMessage = asyncHandler(async (req: AuthRequest, res: Response) => {
         const { message, conversationId } = req.body as SendMessageRequest;
-        const userId = req.userId || 'anonymous-user'; // Fallback until auth middleware is added
+        const userId = req.userId!; // Guaranteed by requireAuth middleware
 
         if (!message || typeof message !== 'string' || message.trim() === '') {
             throw new AppError(400, 'Message is required');
@@ -47,7 +47,7 @@ export class ChatController {
      * GET /api/chat/conversations
      */
     getConversations = asyncHandler(async (req: AuthRequest, res: Response) => {
-        const userId = req.userId || 'anonymous-user';
+        const userId = req.userId!; // Guaranteed by requireAuth middleware
         const page = parseInt(req.query.page as string) || 1;
         const limit = parseInt(req.query.limit as string) || 20;
         const status = req.query.status as 'active' | 'archived' | undefined;
@@ -68,7 +68,7 @@ export class ChatController {
      */
     getConversationDetails = asyncHandler(async (req: AuthRequest, res: Response) => {
         const { id } = req.params;
-        const userId = req.userId || 'anonymous-user';
+        const userId = req.userId!; // Guaranteed by requireAuth middleware
 
         const conversation = await this.conversationRepo.findByIdAndUser(id, userId);
 
@@ -89,7 +89,7 @@ export class ChatController {
      */
     getMessages = asyncHandler(async (req: AuthRequest, res: Response) => {
         const { id } = req.params;
-        const userId = req.userId || 'anonymous-user';
+        const userId = req.userId!; // Guaranteed by requireAuth middleware
         const limit = parseInt(req.query.limit as string) || 50;
         const beforeStr = req.query.before as string | undefined;
 
@@ -116,7 +116,7 @@ export class ChatController {
      */
     deleteConversation = asyncHandler(async (req: AuthRequest, res: Response) => {
         const { id } = req.params;
-        const userId = req.userId || 'anonymous-user';
+        const userId = req.userId!; // Guaranteed by requireAuth middleware
 
         const conversation = await this.conversationRepo.findByIdAndUser(id, userId);
         if (!conversation) {

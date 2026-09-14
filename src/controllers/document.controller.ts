@@ -1,4 +1,4 @@
-import { Request, Response } from 'express';
+import { Response } from 'express';
 import { randomUUID } from 'crypto';
 import { AiService } from '../services/ai.service';
 import { DocumentService } from '../services/document.service';
@@ -7,7 +7,9 @@ import { asyncHandler } from '../middleware/error.middleware';
 import { AppError } from '../middleware/error.middleware';
 import { loggerUtil } from '../utils/logger.util';
 import { GenerateDocRequest, DocumentSection, DocumentStructure } from '../types/document.types';
+import { AuthRequest } from './chat.controller';
 import { ConversationRepository } from '../repositories/conversation.repository';
+import { MessageRepository } from '../repositories/message.repository';
 
 /**
  * Document Controller
@@ -22,12 +24,14 @@ export class DocumentController {
     private documentService: DocumentService;
     private conversationRepo: ConversationRepository;
     private promptSynthesisService: PromptSynthesisService;
+    private messageRepo: MessageRepository;
 
     constructor() {
         this.aiService = new AiService();
         this.documentService = new DocumentService();
         this.conversationRepo = new ConversationRepository();
         this.promptSynthesisService = new PromptSynthesisService();
+        this.messageRepo = new MessageRepository();
     }
 
     // ── Utility: Assign UUIDs to all sections recursively ─────────────────────
@@ -172,18 +176,29 @@ export class DocumentController {
      * POST /api/document/generate
      * Body: { conversationId?, intent?, prompt?, documentType?, template? }
      */
-    generate = asyncHandler(async (req: Request, res: Response) => {
+    generate = asyncHandler(async (req: AuthRequest, res: Response) => {
         const {
             prompt,
             documentType,
             template,
             conversationId,
             intent,
+            messageId,
         } = req.body as GenerateDocRequest;
+
+        const userId = req.userId!;
 
         // Validate: either conversationId or prompt must be provided
         if (!conversationId && (!prompt || typeof prompt !== 'string' || prompt.trim().length === 0)) {
             throw new AppError(400, 'Either conversationId or a non-empty prompt string is required');
+        }
+
+        if (conversationId) {
+            // Security check: ensure user owns this conversation
+            const conversation = await this.conversationRepo.findByIdAndUser(conversationId, userId);
+            if (!conversation) {
+                throw new AppError(404, 'Conversation not found or access denied');
+            }
         }
 
         loggerUtil.info('Document generation request received', {
@@ -192,6 +207,7 @@ export class DocumentController {
             template: template || 'generic',
             conversationId: conversationId || 'none',
             intent: intent || 'create',
+            userId
         });
 
         // ── Step 1: Resolve the prompt ────────────────────────────────────────────
@@ -298,6 +314,11 @@ export class DocumentController {
                     version: savedVersion,
                     fileName: structure.fileName,
                 });
+
+                // Link the saved document version back to the triggering assistant message
+                if (savedVersion !== null && messageId) {
+                    await this.messageRepo.linkDocumentVersion(messageId, savedVersion);
+                }
             } catch (versionErr) {
                 loggerUtil.error('Failed to save document version', versionErr as Error, { conversationId });
             }
@@ -319,7 +340,7 @@ export class DocumentController {
      * Generate document structure only (preview/debug)
      * POST /api/document/preview
      */
-    preview = asyncHandler(async (req: Request, res: Response) => {
+    preview = asyncHandler(async (req: AuthRequest, res: Response) => {
         const { prompt, documentType, template } = req.body as GenerateDocRequest;
 
         if (!prompt || typeof prompt !== 'string' || prompt.trim().length === 0) {
@@ -338,5 +359,57 @@ export class DocumentController {
             data: structure,
             usage: usageMetadata,
         });
+    });
+
+    /**
+     * Download a specific version of a document for a conversation.
+     * Rebuilds the DOCX from the stored JSON without calling the AI.
+     * GET /api/document/conversations/:conversationId/download?version=N
+     */
+    download = asyncHandler(async (req: AuthRequest, res: Response) => {
+        const { conversationId } = req.params;
+        const versionParam = req.query.version as string;
+        const userId = req.userId!;
+
+        if (!conversationId) {
+            throw new AppError(400, 'Conversation ID is required');
+        }
+
+        const conv = await this.conversationRepo.findByIdAndUser(conversationId, userId);
+        if (!conv || !conv.document || !conv.document.versions || conv.document.versions.length === 0) {
+            throw new AppError(404, 'No generated document found for this conversation');
+        }
+
+        let targetVersion = conv.document.currentVersion; // default to latest
+
+        if (versionParam) {
+            const requestedVersion = parseInt(versionParam, 10);
+            if (isNaN(requestedVersion)) {
+                throw new AppError(400, 'Invalid version parameter');
+            }
+            if (requestedVersion > conv.document.currentVersion || requestedVersion < 1) {
+                throw new AppError(404, `Document version v${requestedVersion} not found`);
+            }
+            targetVersion = requestedVersion;
+        }
+
+        // The array is chronological, find the specific version
+        const versionData = conv.document.versions.find(v => v.version === targetVersion);
+        if (!versionData) {
+            throw new AppError(404, `Document version v${targetVersion} structure is missing`);
+        }
+
+        const structure = versionData.structure as DocumentStructure;
+
+        // Rebuild the DOCX from JSON
+        const buffer = await this.documentService.buildDocx(structure);
+        const fileName = structure.fileName || `document-v${targetVersion}.docx`;
+
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+        res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+        res.setHeader('Content-Length', buffer.length.toString());
+
+        loggerUtil.info('Document re-downloaded successfully', { conversationId, version: targetVersion, fileName, fileSize: buffer.length });
+        res.send(buffer);
     });
 }

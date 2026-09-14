@@ -1,6 +1,6 @@
 import Redis from 'ioredis';
 import { env } from './env.config';
-import { loggerUtil } from '@utils/logger.util';
+import { loggerUtil } from '../utils/logger.util';
 
 /**
  * Redis client instance

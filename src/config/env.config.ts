@@ -29,6 +29,10 @@ interface EnvConfig {
 
     // Gemini AI
     GEMINI_API_KEY: string;
+
+    // Google Auth
+    GOOGLE_CLIENT_ID: string;
+    GOOGLE_CLIENT_SECRET: string;
 }
 
 const getEnvConfig = (): EnvConfig => {
@@ -38,7 +42,7 @@ const getEnvConfig = (): EnvConfig => {
         NODE_ENV: process.env.NODE_ENV || 'development',
 
         // CORS
-        ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:3000'],
+        ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:5173'],
 
         // File Upload
         MAX_FILE_SIZE: parseInt(process.env.MAX_FILE_SIZE || '10485760', 10), // 10MB default
@@ -57,6 +61,10 @@ const getEnvConfig = (): EnvConfig => {
 
         // Gemini AI
         GEMINI_API_KEY: process.env.GEMINI_API_KEY || '',
+
+        // Google Auth
+        GOOGLE_CLIENT_ID: process.env.GOOGLE_CLIENT_ID || '',
+        GOOGLE_CLIENT_SECRET: process.env.GOOGLE_CLIENT_SECRET || '',
     };
 };
 

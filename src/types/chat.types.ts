@@ -21,6 +21,7 @@ export interface ChatResponse {
     intent: MessageIntent;
     conversationId: string;
     conversationTitle: string;
+    assistantMessageId: string;  // _id of the saved assistant message — used to link doc versions
 }
 
 /**

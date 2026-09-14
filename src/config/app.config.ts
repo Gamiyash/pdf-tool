@@ -3,6 +3,9 @@ import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
 import compression from 'compression';
+import session from 'express-session';
+import MongoStore from 'connect-mongo';
+import passport from './passport';
 import { env } from './env.config';
 import { errorHandler } from '../middleware/error.middleware';
 import { notFoundHandler } from '../middleware/notFound.middleware';
@@ -27,6 +30,21 @@ export const configureApp = (app: Application): void => {
 
     // Compression middleware
     app.use(compression());
+
+    // Sessions & Passport Configuration
+    app.use(session({
+        secret: process.env.SESSION_SECRET || 'dev-secure-session-secret-999',
+        resave: false,
+        saveUninitialized: false,
+        store: MongoStore.create({ mongoUrl: env.MONGODB_URI }),
+        cookie: {
+            secure: env.NODE_ENV === 'production',
+            httpOnly: true,
+            maxAge: 1000 * 60 * 60 * 24 // 1 day
+        }
+    }));
+    app.use(passport.initialize());
+    app.use(passport.session());
 
     // Logging middleware - integrate Morgan with Winston
     const morganFormat = env.NODE_ENV === 'development' ? 'dev' : 'combined';

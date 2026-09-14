@@ -134,6 +134,7 @@ export interface GenerateDocRequest {
     template?: 'generic' | 'academic';  // which skills template to use (default: "generic")
     conversationId?: string;    // Required for chat-based flow (prompt will be synthesized)
     intent?: 'create' | 'edit'; // "edit" attaches latest doc JSON for modification
+    messageId?: string;         // The assistant message _id that triggered this generation
 }
 
 /**

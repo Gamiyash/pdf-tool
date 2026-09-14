@@ -20,8 +20,9 @@ export interface IMessage extends Document {
     conversationId: Types.ObjectId;
     role: MessageRole;
     content: string;
-    summary?: string;            // Short version for history (max 500 chars), assistant only
-    intent: MessageIntent | null;    // Only set on assistant messages
+    summary?: string;               // Short version for history (max 500 chars), assistant only
+    intent: MessageIntent | null;   // Only set on assistant messages
+    documentVersionRef?: number;    // Which doc version this message triggered (null = not yet generated)
     metadata: IMessageMetadata;
     createdAt: Date;
 }
@@ -51,6 +52,11 @@ const MessageSchema = new Schema<IMessage>(
             type: String,
             enum: ['create', 'edit', 'chatting', null],
             default: null,
+        },
+        documentVersionRef: {
+            type: Number,
+            default: null,
+            index: true,  // cheap lookup: find all messages tied to a specific doc version
         },
         metadata: {
             promptTokens: { type: Number },

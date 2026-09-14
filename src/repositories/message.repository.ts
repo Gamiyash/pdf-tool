@@ -11,8 +11,9 @@ export interface CreateMessageData {
     conversationId: string;
     role: MessageRole;
     content: string;
-    summary?: string;             // Short version used in history (assistant only)
+    summary?: string;                  // Short version used in history (assistant only)
     intent?: MessageIntent | null;
+    documentVersionRef?: number;       // Set after doc generation to link message → version
     metadata?: IMessageMetadata;
 }
 
@@ -127,5 +128,19 @@ export class MessageRepository {
         });
 
         return result.deletedCount;
+    }
+
+    /**
+     * Stamp a document version number onto an assistant message.
+     * Called after a DOCX is generated so the message permanently records which version it produced.
+     * Idempotent — safe to call multiple times (last write wins).
+     */
+    async linkDocumentVersion(messageId: string, version: number): Promise<void> {
+        await Message.findByIdAndUpdate(
+            messageId,
+            { $set: { documentVersionRef: version } }
+        ).exec();
+
+        loggerUtil.info('Linked document version to message', { messageId, version });
     }
 }

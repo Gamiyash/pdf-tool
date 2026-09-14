@@ -3,10 +3,12 @@ import pdfRoutes from './pdf.routes';
 import healthRoutes from './health.routes';
 import documentRoutes from './document.routes';
 import chatRoutes from './chat.routes';
+import authRoutes from './auth.routes';
 
 const router = Router();
 
 // Mount routes
+router.use('/auth', authRoutes);
 router.use('/health', healthRoutes);
 router.use('/pdf', pdfRoutes);
 router.use('/document', documentRoutes);

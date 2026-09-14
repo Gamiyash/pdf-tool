@@ -1,6 +1,8 @@
 import { Router } from 'express';
 import { ChatController } from '../controllers/chat.controller';
 
+import { requireAuth } from '../middleware/auth.middleware';
+
 const router = Router();
 const chatController = new ChatController();
 
@@ -10,14 +12,14 @@ const chatController = new ChatController();
  */
 
 // Core chat endpoint
-router.post('/send', chatController.sendMessage);
+router.post('/send', requireAuth, chatController.sendMessage);
 
 // Conversation management
-router.get('/conversations', chatController.getConversations);
-router.get('/conversations/:id', chatController.getConversationDetails);
-router.delete('/conversations/:id', chatController.deleteConversation);
+router.get('/conversations', requireAuth, chatController.getConversations);
+router.get('/conversations/:id', requireAuth, chatController.getConversationDetails);
+router.delete('/conversations/:id', requireAuth, chatController.deleteConversation);
 
 // Message retrieval
-router.get('/conversations/:id/messages', chatController.getMessages);
+router.get('/conversations/:id/messages', requireAuth, chatController.getMessages);
 
 export default router;

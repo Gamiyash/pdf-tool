@@ -1,6 +1,6 @@
 import mongoose from 'mongoose';
 import { env } from './env.config';
-import { loggerUtil } from '@utils/logger.util';
+import { loggerUtil } from '../utils/logger.util';
 
 /**
  * MongoDB connection options

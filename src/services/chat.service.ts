@@ -197,8 +197,11 @@ export class ChatService {
 
             // 7. Save assistant message + update conversation, and await synthesis in parallel
             const usageMetadata = result.response.usageMetadata;
-            const [_] = await Promise.all([
-                saveUserMsgPromise,
+            // Wait for user message save first (needed for message count accuracy)
+            await saveUserMsgPromise;
+
+            // Save assistant message and increment count in parallel
+            const [assistantMsg] = await Promise.all([
                 this.messageRepo.create({
                     conversationId,
                     role: 'assistant',
@@ -210,10 +213,10 @@ export class ChatService {
                         promptTokens: usageMetadata?.promptTokenCount,
                         completionTokens: usageMetadata?.candidatesTokenCount,
                         totalTokens: usageMetadata?.totalTokenCount,
-                        tokensUsed: usageMetadata?.candidatesTokenCount, // compatibility fallback
+                        tokensUsed: usageMetadata?.candidatesTokenCount,
                     }
                 }),
-                this.conversationRepo.incrementMessageCountBy(conversationId, 2)
+                this.conversationRepo.incrementMessageCountBy(conversationId, 2),
             ]);
 
             return {
@@ -221,6 +224,7 @@ export class ChatService {
                 intent: aiResponse.intent,
                 conversationId,
                 conversationTitle,
+                assistantMessageId: (assistantMsg._id as any).toString(),
             };
 
         } catch (error) {

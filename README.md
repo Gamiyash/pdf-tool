@@ -79,7 +79,7 @@ PDF_Project/
    npm run dev
    ```
 
-   The server will start on http://localhost:3000
+   The server will start on http://localhost:3001
 
 ## 📝 Available Scripts
 
@@ -126,7 +126,7 @@ PDF_Project/
 ```env
 PORT=3000
 NODE_ENV=development
-ALLOWED_ORIGINS=http://localhost:3000,http://localhost:5173
+ALLOWED_ORIGINS=http://localhost:3001,http://localhost:5173
 MAX_FILE_SIZE=10485760
 UPLOAD_DIR=./uploads
 ```
