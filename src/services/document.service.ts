@@ -20,6 +20,7 @@ import {
     TabStopType,
     ISectionOptions,
     SectionType as WordSectionType,
+    LineRuleType,
 } from 'docx';
 import {
     DocumentStructure,
@@ -28,6 +29,8 @@ import {
     TextRunData,
     TableRowData,
 } from '../types/document.types';
+import JSZip from 'jszip';
+import { DOMParser, XMLSerializer } from '@xmldom/xmldom';
 import { loggerUtil } from '../utils/logger.util';
 import { AppError } from '../middleware/error.middleware';
 
@@ -109,6 +112,21 @@ const normalizeText = (value: any): string => {
 
 // Backward-compatible alias
 const stripMarkdown = normalizeText;
+
+/**
+ * Safely splits a string containing \n into an array of TextRuns with explicit breaks.
+ * This prevents the DOCX engine from rendering lines on top of each other.
+ */
+function buildMultilineTextRuns(text: string, options: any): TextRun[] {
+    const lines = text.split('\n');
+    return lines.flatMap((line, index) => {
+        const run = new TextRun({ ...options, text: line });
+        if (index < lines.length - 1) {
+            return [run, new TextRun({ break: 1 })];
+        }
+        return [run];
+    });
+}
 
 /**
  * Document Service - Converts DocumentStructure JSON into DOCX buffer
@@ -232,17 +250,113 @@ export class DocumentService {
             });
 
             const buffer = await Packer.toBuffer(doc);
+            const sdtBuffer = await this.injectSdtContentControls(buffer as Buffer);
 
             loggerUtil.info('DOCX document built successfully', {
-                bufferSize: buffer.length,
+                bufferSize: sdtBuffer.length,
                 fileName: structure.fileName,
             });
 
-            return buffer as Buffer;
+            return sdtBuffer;
 
         } catch (error) {
             loggerUtil.error('Failed to build DOCX document', error as Error);
             throw new AppError(500, 'Failed to build DOCX document');
+        }
+    }
+
+    /**
+     * Post-process DOCX XML to wrap sections with sec_UUID bookmarks inside Word Content Controls (<w:sdt>).
+     * Content Controls (<w:sdt>) are structural document tags with permanent <w:tag w:val="sec_UUID"/> attributes
+     * that survive rich-text editor round-trips (unlike bookmarks which get stripped).
+     */
+    private async injectSdtContentControls(buffer: Buffer): Promise<Buffer> {
+        try {
+            const zip = await JSZip.loadAsync(buffer);
+            const docXml = await zip.file('word/document.xml')?.async('string');
+            if (!docXml) return buffer;
+
+            const dom = new DOMParser().parseFromString(docXml, 'text/xml');
+            const bookmarkStartNodes = dom.getElementsByTagName('w:bookmarkStart');
+
+            const bookmarksToWrap: { secId: string; targetBlockNode: Element }[] = [];
+            const WORD_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+
+            for (let i = 0; i < bookmarkStartNodes.length; i++) {
+                const bmNode = bookmarkStartNodes.item(i) as any;
+                if (!bmNode) continue;
+
+                const name = bmNode.getAttribute('w:name') || bmNode.getAttribute('name');
+                if (name && name.startsWith('sec_')) {
+                    // Find parent block container (<w:p> or <w:tbl>)
+                    let curr: any = bmNode;
+                    let targetBlockNode: any = null;
+
+                    while (curr && curr.parentNode) {
+                        const nodeName = curr.nodeName;
+                        if (nodeName === 'w:p' || nodeName === 'w:tbl') {
+                            targetBlockNode = curr;
+                            break;
+                        }
+                        curr = curr.parentNode;
+                    }
+
+                    if (targetBlockNode && targetBlockNode.parentNode) {
+                        // Check that this block is not already wrapped in <w:sdt>
+                        const isAlreadyWrapped = targetBlockNode.parentNode.nodeName === 'w:sdtContent';
+                        if (!isAlreadyWrapped) {
+                            bookmarksToWrap.push({ secId: name, targetBlockNode });
+                        }
+                    }
+                }
+            }
+
+            if (bookmarksToWrap.length === 0) {
+                return buffer;
+            }
+
+            loggerUtil.info('Injecting XML DOM Content Controls (<w:sdt>)', { sectionCount: bookmarksToWrap.length });
+
+            let idCounter = 10000000 + Math.floor(Math.random() * 90000000);
+
+            for (const { secId, targetBlockNode } of bookmarksToWrap) {
+                const parent = (targetBlockNode as any).parentNode;
+                if (!parent) continue;
+
+                // Create <w:sdt>
+                const sdt: any = dom.createElementNS(WORD_NS, 'w:sdt');
+                const sdtPr: any = dom.createElementNS(WORD_NS, 'w:sdtPr');
+
+                const tag: any = dom.createElementNS(WORD_NS, 'w:tag');
+                tag.setAttribute('w:val', secId);
+
+                const id: any = dom.createElementNS(WORD_NS, 'w:id');
+                id.setAttribute('w:val', String(idCounter++));
+
+                const W15_NS = 'http://schemas.microsoft.com/office/word/2012/wordml';
+                const appearance: any = dom.createElementNS(W15_NS, 'w15:appearance');
+                appearance.setAttribute('w15:val', 'hidden');
+
+                sdtPr.appendChild(tag);
+                sdtPr.appendChild(id);
+                sdtPr.appendChild(appearance);
+
+                const sdtContent: any = dom.createElementNS(WORD_NS, 'w:sdtContent');
+
+                // Replace targetBlockNode with sdt in parent
+                parent.replaceChild(sdt, targetBlockNode);
+                sdtContent.appendChild(targetBlockNode);
+                sdt.appendChild(sdtPr);
+                sdt.appendChild(sdtContent);
+            }
+
+            const updatedXml = new XMLSerializer().serializeToString(dom);
+            zip.file('word/document.xml', updatedXml);
+            const sdtBuffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+            return sdtBuffer;
+        } catch (err) {
+            loggerUtil.error('Failed to inject XML DOM Content Controls into DOCX', err as Error);
+            return buffer;
         }
     }
 
@@ -291,6 +405,35 @@ export class DocumentService {
         flushOneColBuffer();
 
         return wordSections;
+    }
+
+    /**
+     * Helper to render Header/Footer cells while respecting user-edited textRuns.
+     */
+    private buildHeaderFooterCellRuns(
+        runs: TextRunData[] | undefined,
+        fallbackText: string,
+        theme: DocumentTheme | undefined,
+        defaultSize: number,
+        defaultColor: string,
+        isBold: boolean
+    ): TextRun[] {
+        if (runs && runs.length > 0) {
+            return runs.flatMap(run => buildMultilineTextRuns(run.text, {
+                bold: run.bold ?? isBold,
+                italics: run.italic || false,
+                underline: run.underline ? {} : undefined,
+                color: run.color || defaultColor,
+                font: run.font || theme?.fontFamily || 'Arial',
+                size: run.fontSize || defaultSize,
+            }));
+        }
+        return buildMultilineTextRuns(fallbackText, {
+            font: theme?.fontFamily || 'Arial',
+            size: defaultSize,
+            bold: isBold,
+            color: defaultColor,
+        });
     }
 
     /**
@@ -343,15 +486,14 @@ export class DocumentService {
                                             children: [
                                                 new Paragraph({
                                                     alignment: AlignmentType.LEFT,
-                                                    children: [
-                                                        new TextRun({
-                                                            text: structure.headerFooter?.headerLeft || structure.title,
-                                                            font: structure.theme?.fontFamily || 'Arial',
-                                                            size: FONT_SIZES.caption,
-                                                            bold: true,
-                                                            color: structure.theme?.headingColor || '333333',
-                                                        }),
-                                                    ],
+                                                    children: this.buildHeaderFooterCellRuns(
+                                                        structure.headerFooter?.headerLeftRuns,
+                                                        structure.headerFooter?.headerLeft || structure.title,
+                                                        structure.theme,
+                                                        FONT_SIZES.caption,
+                                                        structure.theme?.headingColor || '333333',
+                                                        true
+                                                    ),
                                                 }),
                                             ],
                                         }),
@@ -362,14 +504,14 @@ export class DocumentService {
                                             children: [
                                                 new Paragraph({
                                                     alignment: AlignmentType.CENTER,
-                                                    children: [
-                                                        new TextRun({
-                                                            text: structure.headerFooter!.headerCenter!,
-                                                            font: structure.theme?.fontFamily || 'Arial',
-                                                            size: FONT_SIZES.headerFooter,
-                                                            color: structure.theme?.headingColor || '333333',
-                                                        }),
-                                                    ],
+                                                    children: this.buildHeaderFooterCellRuns(
+                                                        structure.headerFooter?.headerCenterRuns,
+                                                        structure.headerFooter!.headerCenter!,
+                                                        structure.theme,
+                                                        FONT_SIZES.headerFooter,
+                                                        structure.theme?.headingColor || '333333',
+                                                        false
+                                                    ),
                                                 }),
                                             ],
                                         })] : []),
@@ -380,14 +522,14 @@ export class DocumentService {
                                             children: [
                                                 new Paragraph({
                                                     alignment: AlignmentType.RIGHT,
-                                                    children: [
-                                                        new TextRun({
-                                                            text: structure.headerFooter?.headerRight || 'v1.0',
-                                                            font: structure.theme?.fontFamily || 'Arial',
-                                                            size: FONT_SIZES.headerFooter,
-                                                            color: '999999',
-                                                        }),
-                                                    ],
+                                                    children: this.buildHeaderFooterCellRuns(
+                                                        structure.headerFooter?.headerRightRuns,
+                                                        structure.headerFooter?.headerRight || 'v1.0',
+                                                        structure.theme,
+                                                        FONT_SIZES.headerFooter,
+                                                        '999999',
+                                                        false
+                                                    ),
                                                 }),
                                             ],
                                         }),
@@ -423,14 +565,14 @@ export class DocumentService {
                                             children: [
                                                 new Paragraph({
                                                     alignment: AlignmentType.LEFT,
-                                                    children: [
-                                                        new TextRun({
-                                                            text: structure.headerFooter?.footerLeft || 'Confidential',
-                                                            font: structure.theme?.fontFamily || 'Arial',
-                                                            size: FONT_SIZES.headerFooter,
-                                                            color: '999999',
-                                                        }),
-                                                    ],
+                                                    children: this.buildHeaderFooterCellRuns(
+                                                        structure.headerFooter?.footerLeftRuns,
+                                                        structure.headerFooter?.footerLeft || 'Confidential',
+                                                        structure.theme,
+                                                        FONT_SIZES.headerFooter,
+                                                        '999999',
+                                                        false
+                                                    ),
                                                 }),
                                             ],
                                         }),
@@ -441,14 +583,14 @@ export class DocumentService {
                                             children: [
                                                 new Paragraph({
                                                     alignment: AlignmentType.CENTER,
-                                                    children: [
-                                                        new TextRun({
-                                                            text: structure.headerFooter!.footerCenter!,
-                                                            font: structure.theme?.fontFamily || 'Arial',
-                                                            size: FONT_SIZES.headerFooter,
-                                                            color: '999999',
-                                                        }),
-                                                    ],
+                                                    children: this.buildHeaderFooterCellRuns(
+                                                        structure.headerFooter?.footerCenterRuns,
+                                                        structure.headerFooter!.footerCenter!,
+                                                        structure.theme,
+                                                        FONT_SIZES.headerFooter,
+                                                        '999999',
+                                                        false
+                                                    ),
                                                 }),
                                             ],
                                         })] : []),
@@ -537,53 +679,55 @@ export class DocumentService {
 
         for (const section of sections) {
             try {
+                const secId = section.id;
+
                 switch (section.type) {
                     case 'heading': {
                         const bookmarkId = getBookmarkId(section.content || '');
-                        children.push(this.buildHeading(section, theme, bookmarkId));
+                        children.push(this.buildHeading(section, theme, bookmarkId, secId));
                         break;
                     }
 
                     case 'paragraph':
-                        children.push(this.buildParagraph(section, theme));
+                        children.push(...this.buildParagraph(section, theme, secId));
                         break;
 
                     case 'bullet_list':
-                        children.push(...this.buildBulletList(section, theme));
+                        children.push(...this.buildBulletList(section, theme, secId));
                         break;
 
                     case 'numbered_list':
-                        children.push(...this.buildNumberedList(section, theme));
+                        children.push(...this.buildNumberedList(section, theme, secId));
                         break;
 
                     case 'table':
-                        children.push(this.buildTable(section, theme));
+                        children.push(this.buildTable(section, theme, secId));
                         break;
 
                     case 'table_of_contents':
-                        children.push(...this.buildTableOfContents(section, theme, headingInfos));
+                        children.push(...this.buildTableOfContents(section, theme, headingInfos, secId));
                         break;
 
                     case 'horizontal_rule':
-                        children.push(this.buildHorizontalRule());
+                        children.push(this.buildHorizontalRule(secId));
                         break;
 
                     case 'blockquote':
-                        children.push(this.buildBlockquote(section, theme));
+                        children.push(this.buildBlockquote(section, theme, secId));
                         break;
 
                     case 'callout':
                         children.push(new Paragraph({ spacing: { before: 240 }, children: [] }));
-                        children.push(this.buildCallout(section, theme));
+                        children.push(this.buildCallout(section, theme, secId));
                         children.push(new Paragraph({ spacing: { after: 240 }, children: [] }));
                         break;
 
                     case 'section_block':
-                        children.push(this.buildSectionBlock(section, theme, headingInfos));
+                        children.push(this.buildSectionBlock(section, theme, headingInfos, secId));
                         break;
 
                     case 'references':
-                        children.push(...this.buildReferences(section, theme));
+                        children.push(...this.buildReferences(section, theme, secId));
                         break;
 
                     case 'two_column':
@@ -624,7 +768,7 @@ export class DocumentService {
      * ALWAYS applies explicit run formatting (size, color, bold) so headings
      * look correct even inside table cells where Word styles may not apply.
      */
-    private buildHeading(section: DocumentSection, theme: DocumentTheme, bookmarkId?: string): Paragraph {
+    private buildHeading(section: DocumentSection, theme: DocumentTheme, bookmarkId?: string, secId?: string): Paragraph {
         const headingMap: Record<number, typeof HeadingLevel[keyof typeof HeadingLevel]> = {
             1: HeadingLevel.HEADING_1,
             2: HeadingLevel.HEADING_2,
@@ -634,7 +778,6 @@ export class DocumentService {
         const level = section.level || 1;
         const headingText = stripMarkdown(section.content || '');
 
-        // Explicit heading formatting per level — uses centralized FONT_SIZES
         const headingStyles: Record<number, { size: number; color: string; spacingBefore: number; spacingAfter: number }> = {
             1: { size: FONT_SIZES.h1, color: theme.headingColor || '1A1A2E', spacingBefore: 400, spacingAfter: 200 },
             2: { size: FONT_SIZES.h2, color: theme.subHeadingColor || '16213E', spacingBefore: 300, spacingAfter: 160 },
@@ -642,44 +785,94 @@ export class DocumentService {
         };
         const style = headingStyles[level] || headingStyles[1];
 
-        const runProps = {
-            text: headingText,
-            font: theme.fontFamily || 'Arial',
-            size: style.size,
-            bold: true as const,
-            color: style.color,
-        };
+        let runChildren: (TextRun | Bookmark)[] = [];
 
-        // If we have a bookmark ID, wrap the heading text in a Bookmark
-        // so the TOC can link to this exact location
+        if (secId) {
+            runChildren.push(new Bookmark({
+                id: `sec_${secId}`,
+                children: [new TextRun({ text: '' })],
+            }));
+        }
+
+        if (section.textRuns && section.textRuns.length > 0) {
+            for (const run of section.textRuns) {
+                runChildren.push(new TextRun({
+                    text: run.text,
+                    bold: run.bold ?? true,
+                    italics: run.italic || false,
+                    underline: run.underline ? {} : undefined,
+                    color: run.color || style.color,
+                    font: run.font || theme.fontFamily || 'Arial',
+                    size: run.fontSize || style.size,
+                }));
+            }
+        } else {
+            runChildren.push(new TextRun({
+                text: headingText,
+                font: theme.fontFamily || 'Arial',
+                size: style.size,
+                bold: true,
+                color: style.color,
+            }));
+        }
+
         const children = bookmarkId
             ? [
                 new Bookmark({
                     id: bookmarkId,
-                    children: [new TextRun(runProps)],
+                    children: [new TextRun({ text: '' })],
                 }),
+                ...runChildren,
             ]
-            : [new TextRun(runProps)];
+            : runChildren;
 
         return new Paragraph({
             heading: headingMap[level] || HeadingLevel.HEADING_1,
             spacing: { before: style.spacingBefore, after: style.spacingAfter },
             pageBreakBefore: section.pageBreakBefore || false,
             alignment: this.getAlignment(section.alignment),
-            children,
+            children: children as any,
         });
     }
 
     /**
-     * Build a paragraph (plain text or rich text with textRuns)
+     * Build one or more paragraphs (plain text or rich text with textRuns)
      */
-    private buildParagraph(section: DocumentSection, theme: DocumentTheme): Paragraph {
-        let textChildren: TextRun[];
+    private buildParagraph(section: DocumentSection, theme: DocumentTheme, secId?: string): Paragraph[] {
+        const secBm = secId ? [new Bookmark({ id: `sec_${secId}`, children: [new TextRun({ text: '' })] })] : [];
+
+        // If multi-paragraph rich text exists from user edits, preserve each paragraph distinctly
+        if (section.parasRuns && section.parasRuns.length > 1) {
+            return section.parasRuns.map((pRuns, index) => {
+                const runs = pRuns.flatMap((run: TextRunData) =>
+                    buildMultilineTextRuns(run.text, {
+                        bold: run.bold || false,
+                        italics: run.italic || false,
+                        underline: run.underline ? {} : undefined,
+                        size: run.fontSize || FONT_SIZES.body,
+                        font: run.font || theme.fontFamily || 'Arial',
+                        color: run.color || theme.textColor || '333333',
+                    })
+                );
+                return new Paragraph({
+                    spacing: {
+                        before: index === 0 ? section.spacing?.before : 80,
+                        after: index === section.parasRuns!.length - 1 ? (section.spacing?.after ?? 120) : 80,
+                        line: 276,
+                        lineRule: LineRuleType.AUTO,
+                    },
+                    alignment: this.getAlignment(section.alignment),
+                    pageBreakBefore: index === 0 ? (section.pageBreakBefore || false) : false,
+                    children: (index === 0 ? [...secBm, ...runs] : runs) as any,
+                });
+            });
+        }
+
+        let textChildren: (TextRun | Bookmark)[];
 
         if (section.textRuns && section.textRuns.length > 0) {
-            textChildren = section.textRuns.map((run: TextRunData) =>
-                new TextRun({
-                    text: run.text,
+            const runs = section.textRuns.flatMap((run: TextRunData) =>
+                buildMultilineTextRuns(run.text, {
                     bold: run.bold || false,
                     italics: run.italic || false,
                     underline: run.underline ? {} : undefined,
@@ -688,55 +881,100 @@ export class DocumentService {
                     color: run.color || theme.textColor || '333333',
                 })
             );
+            textChildren = [...secBm, ...runs];
         } else {
-            textChildren = [
-                new TextRun({
-                    text: stripMarkdown(section.content || ''),
-                    font: theme.fontFamily || 'Arial',
-                    size: FONT_SIZES.body,
-                    color: theme.textColor || '333333',
-                }),
-            ];
+            const rawContent = stripMarkdown(section.content || '');
+            const lines = rawContent.split(/\r?\n/).filter(l => l.trim().length > 0);
+            if (lines.length > 1) {
+                return lines.map((line, index) => {
+                    const runs = [
+                        new TextRun({
+                            text: line,
+                            font: theme.fontFamily || 'Arial',
+                            size: FONT_SIZES.body,
+                            color: theme.textColor || '333333',
+                        })
+                    ];
+                    return new Paragraph({
+                        spacing: {
+                            before: index === 0 ? section.spacing?.before : 80,
+                            after: index === lines.length - 1 ? (section.spacing?.after ?? 120) : 80,
+                            line: 276,
+                            lineRule: LineRuleType.AUTO,
+                        },
+                        alignment: this.getAlignment(section.alignment),
+                        pageBreakBefore: index === 0 ? (section.pageBreakBefore || false) : false,
+                        children: (index === 0 ? [...secBm, ...runs] : runs) as any,
+                    });
+                });
+            }
+
+            const runs = buildMultilineTextRuns(rawContent, {
+                font: theme.fontFamily || 'Arial',
+                size: FONT_SIZES.body,
+                color: theme.textColor || '333333',
+            });
+            textChildren = [...secBm, ...runs];
         }
 
-        return new Paragraph({
-            spacing: {
-                before: section.spacing?.before,
-                after: section.spacing?.after ?? 200,
-                line: 360
-            },
-            alignment: this.getAlignment(section.alignment),
-            pageBreakBefore: section.pageBreakBefore || false,
-            children: textChildren,
-        });
+        return [
+            new Paragraph({
+                spacing: {
+                    before: section.spacing?.before,
+                    after: section.spacing?.after ?? 120,
+                    line: 276,
+                    lineRule: LineRuleType.AUTO,
+                },
+                alignment: this.getAlignment(section.alignment),
+                pageBreakBefore: section.pageBreakBefore || false,
+                children: textChildren as any,
+            }),
+        ];
     }
 
     /**
      * Build bullet list items (using LevelFormat.BULLET - NEVER unicode bullets)
      */
-    private buildBulletList(section: DocumentSection, theme: DocumentTheme): Paragraph[] {
+    private buildBulletList(section: DocumentSection, theme: DocumentTheme, secId?: string): Paragraph[] {
         const items = section.items || [];
         const paragraphs: Paragraph[] = [];
 
         if (items.length > 0) {
-            for (const item of items) {
+            for (let i = 0; i < items.length; i++) {
+                const item = items[i];
+                const itemRuns = section.itemRuns?.[i];
+
+                const secBm = (secId && i === 0) ? [new Bookmark({ id: `sec_${secId}`, children: [new TextRun({ text: '' })] })] : [];
+
+                const itemChildren = (itemRuns && itemRuns.length > 0)
+                    ? itemRuns.map(r => new TextRun({
+                        text: r.text,
+                        font: r.font || theme.fontFamily || 'Arial',
+                        size: r.fontSize || FONT_SIZES.list,
+                        bold: r.bold ?? false,
+                        italics: r.italic ?? false,
+                        color: r.color || theme.textColor || '333333',
+                        underline: r.underline ? {} : undefined,
+                    }))
+                    : [
+                        new TextRun({
+                            text: stripMarkdown(item),
+                            font: theme.fontFamily || 'Arial',
+                            size: FONT_SIZES.list,
+                            color: theme.textColor || '333333',
+                        }),
+                    ];
+
                 paragraphs.push(
                     new Paragraph({
                         numbering: { reference: 'bullets', level: 0 },
-                        spacing: { after: 80 },
-                        children: [
-                            new TextRun({
-                                text: stripMarkdown(item),
-                                font: theme.fontFamily || 'Arial',
-                                size: FONT_SIZES.list,
-                                color: theme.textColor || '333333',
-                            }),
-                        ],
+                        spacing: { after: 80, line: 276, lineRule: LineRuleType.AUTO },
+                        children: [...secBm, ...itemChildren] as any,
                     })
                 );
             }
 
-            paragraphs.push(new Paragraph({ spacing: { after: 200 }, children: [] }));
+            paragraphs.push(new Paragraph({ spacing: { after: 160 }, children: [] }));
         }
 
         return paragraphs;
@@ -745,32 +983,48 @@ export class DocumentService {
     /**
      * Build numbered list items
      */
-    private buildNumberedList(section: DocumentSection, theme: DocumentTheme): Paragraph[] {
+    private buildNumberedList(section: DocumentSection, theme: DocumentTheme, secId?: string): Paragraph[] {
         const items = section.items || [];
         const paragraphs: Paragraph[] = [];
 
         if (items.length > 0) {
-            // Each list uses its own unique reference so numbering always starts at 1
             const ref = `numbered-${this.numberedListCounter++}`;
 
-            for (const item of items) {
+            for (let i = 0; i < items.length; i++) {
+                const item = items[i];
+                const itemRuns = section.itemRuns?.[i];
+
+                const secBm = (secId && i === 0) ? [new Bookmark({ id: `sec_${secId}`, children: [new TextRun({ text: '' })] })] : [];
+
+                const itemChildren = (itemRuns && itemRuns.length > 0)
+                    ? itemRuns.map(r => new TextRun({
+                        text: r.text,
+                        font: r.font || theme.fontFamily || 'Arial',
+                        size: r.fontSize || FONT_SIZES.list,
+                        bold: r.bold ?? false,
+                        italics: r.italic ?? false,
+                        color: r.color || theme.textColor || '333333',
+                        underline: r.underline ? {} : undefined,
+                    }))
+                    : [
+                        new TextRun({
+                            text: stripMarkdown(item),
+                            font: theme.fontFamily || 'Arial',
+                            size: FONT_SIZES.list,
+                            color: theme.textColor || '333333',
+                        }),
+                    ];
+
                 paragraphs.push(
                     new Paragraph({
                         numbering: { reference: ref, level: 0 },
-                        spacing: { after: 80 },
-                        children: [
-                            new TextRun({
-                                text: stripMarkdown(item),
-                                font: theme.fontFamily || 'Arial',
-                                size: FONT_SIZES.list,
-                                color: theme.textColor || '333333',
-                            }),
-                        ],
+                        spacing: { after: 80, line: 276, lineRule: LineRuleType.AUTO },
+                        children: [...secBm, ...itemChildren] as any,
                     })
                 );
             }
 
-            paragraphs.push(new Paragraph({ spacing: { after: 200 }, children: [] }));
+            paragraphs.push(new Paragraph({ spacing: { after: 160 }, children: [] }));
         }
 
         return paragraphs;
@@ -847,17 +1101,53 @@ export class DocumentService {
      * - Each reference entry rendered as-is with 0.5-inch hanging indent
      * - Clean spacing between entries
      */
-    private buildReferences(section: DocumentSection, theme: DocumentTheme): Paragraph[] {
+    private buildReferences(section: DocumentSection, theme: DocumentTheme, secId?: string): Paragraph[] {
         const paragraphs: Paragraph[] = [];
-        const items = section.items || [];
-        const title = section.content || 'References';
+        let items = (section.items && section.items.length > 0) ? section.items : [];
+        let title = 'References';
+
+        if (section.content) {
+            const rawLines = section.content.split('\n').map(l => l.trim()).filter(Boolean);
+            if (rawLines.length > 0) {
+                if (rawLines[0].toLowerCase().includes('reference')) {
+                    title = rawLines[0];
+                    if (items.length === 0 && rawLines.length > 1) {
+                        items = rawLines.slice(1);
+                    }
+                } else if (items.length === 0) {
+                    items = rawLines;
+                }
+            }
+        }
+
+        const secBm = secId ? [new Bookmark({ id: `sec_${secId}`, children: [new TextRun({ text: '' })] })] : [];
+
+        const titleChildren = (section.titleRuns && section.titleRuns.length > 0)
+            ? section.titleRuns.map(r => new TextRun({
+                text: r.text,
+                font: r.font || theme.fontFamily || 'Arial',
+                size: r.fontSize || FONT_SIZES.h1,
+                bold: r.bold ?? true,
+                color: r.color || theme.headingColor || '1A1A2E',
+                italics: r.italic,
+                underline: r.underline ? {} : undefined,
+            }))
+            : [
+                new TextRun({
+                    text: title,
+                    font: theme.fontFamily || 'Arial',
+                    size: FONT_SIZES.h1,
+                    bold: true,
+                    color: theme.headingColor || '1A1A2E',
+                }),
+            ];
 
         // 1. References heading — centered, bold, accent bottom border
         paragraphs.push(
             new Paragraph({
                 pageBreakBefore: true,
                 alignment: AlignmentType.CENTER,
-                spacing: { after: 300 },
+                spacing: { after: 300, line: 276, lineRule: LineRuleType.AUTO },
                 border: {
                     bottom: {
                         color: theme.accentColor || 'D5E8F0',
@@ -866,43 +1156,48 @@ export class DocumentService {
                         size: 12,
                     },
                 },
-                children: [
-                    new TextRun({
-                        text: title,
-                        font: theme.fontFamily || 'Arial',
-                        size: FONT_SIZES.h1,
-                        bold: true,
-                        color: theme.headingColor || '1A1A2E',
-                    }),
-                ],
+                children: [...secBm, ...titleChildren] as any,
             })
         );
 
         // 2. Spacer after heading
         paragraphs.push(new Paragraph({ spacing: { after: 200 }, children: [] }));
 
-        // 3. Each reference entry — rendered as-is, no numbering, no URL manipulation
-        //    Hanging indent (0.5 inch = 720 DXA) matches standard academic formatting
-        for (const item of items) {
+        // 3. Each reference entry — rendered as-is with proper hanging indent & line spacing
+        for (let i = 0; i < items.length; i++) {
+            const item = items[i];
             const refText = typeof item === 'string' ? item.trim() : String(item).trim();
 
             if (!refText) continue;
 
+            const itemRuns = section.itemRuns?.[i];
+            const children = (itemRuns && itemRuns.length > 0)
+                ? itemRuns.map(r => new TextRun({
+                    text: r.text,
+                    font: r.font || theme.fontFamily || 'Arial',
+                    size: r.fontSize || FONT_SIZES.body,
+                    bold: r.bold ?? false,
+                    italics: r.italic ?? false,
+                    color: r.color || theme.textColor || '333333',
+                    underline: r.underline ? {} : undefined,
+                }))
+                : [
+                    new TextRun({
+                        text: refText,
+                        font: theme.fontFamily || 'Arial',
+                        size: FONT_SIZES.body,
+                        color: theme.textColor || '333333',
+                    }),
+                ];
+
             paragraphs.push(
                 new Paragraph({
-                    spacing: { after: 160 },
+                    spacing: { after: 160, line: 276, lineRule: LineRuleType.AUTO },
                     indent: {
                         left: 720,      // 0.5 inch — continuation lines indented
                         hanging: 720,   // Hanging indent — first line pulled back to margin
                     },
-                    children: [
-                        new TextRun({
-                            text: refText,
-                            font: theme.fontFamily || 'Arial',
-                            size: FONT_SIZES.body,
-                            color: theme.textColor || '333333',
-                        }),
-                    ],
+                    children,
                 })
             );
         }
@@ -917,7 +1212,7 @@ export class DocumentService {
      * Build a table with proper dual widths and styling
      * Uses theme accentColor for header shading when cell doesn't specify its own
      */
-    private buildTable(section: DocumentSection, theme: DocumentTheme): Table {
+    private buildTable(section: DocumentSection, theme: DocumentTheme, secId?: string): Table {
         const rows = section.rows || [];
         if (rows.length === 0) {
             return new Table({
@@ -946,7 +1241,7 @@ export class DocumentService {
         const border = { style: BorderStyle.SINGLE, size: 1, color: 'CCCCCC' };
         const borders = { top: border, bottom: border, left: border, right: border };
 
-        const tableRows = rows.map((row: TableRowData) => {
+        const tableRows = rows.map((row: TableRowData, rIndex: number) => {
             const cells = row.cells.map((cell, cellIndex) => {
                 const cellWidth = columnWidths[cellIndex] || defaultColumnWidth;
 
@@ -966,6 +1261,8 @@ export class DocumentService {
                     shading = { fill: ensureHex(theme.accentColor), type: ShadingType.CLEAR, color: 'auto' };
                 }
 
+                const secBm = (secId && rIndex === 0 && cellIndex === 0) ? [new Bookmark({ id: `sec_${secId}`, children: [new TextRun({ text: '' })] })] : [];
+
                 return new TableCell({
                     borders,
                     width: { size: cellWidth, type: WidthType.DXA },
@@ -974,6 +1271,7 @@ export class DocumentService {
                     children: [
                         new Paragraph({
                             children: [
+                                ...secBm,
                                 new TextRun({
                                     text: stripMarkdown(cell.text || ''),
                                     bold: cell.bold || row.isHeader || false,
@@ -981,7 +1279,7 @@ export class DocumentService {
                                     size: FONT_SIZES.table,
                                     color: row.isHeader ? theme.headingColor : (theme.textColor || '333333'),
                                 }),
-                            ],
+                            ] as any,
                         }),
                     ],
                 });
@@ -1034,11 +1332,14 @@ export class DocumentService {
     private buildTableOfContents(
         section: DocumentSection,
         theme: DocumentTheme,
-        headingInfos: { id: string; text: string; level: number }[]
+        headingInfos: { id: string; text: string; level: number }[],
+        secId?: string
     ): Paragraph[] {
         const tocTitle = section.tocTitle || section.content || 'Table of Contents';
         const elements: Paragraph[] = [];
         const linkColor = theme.headingColor || '0563C1';
+
+        const secBm = secId ? [new Bookmark({ id: `sec_${secId}`, children: [new TextRun({ text: '' })] })] : [];
 
         // ─── TOC Title with bottom accent border ───
         elements.push(
@@ -1054,6 +1355,7 @@ export class DocumentService {
                     },
                 },
                 children: [
+                    ...secBm,
                     new TextRun({
                         text: tocTitle,
                         font: theme.fontFamily || 'Arial',
@@ -1061,7 +1363,7 @@ export class DocumentService {
                         bold: true,
                         color: theme.headingColor || '1A1A2E',
                     }),
-                ],
+                ] as any,
             })
         );
 
@@ -1129,7 +1431,8 @@ export class DocumentService {
      * Build a horizontal rule (visual separator)
      * Uses a paragraph with only a bottom border
      */
-    private buildHorizontalRule(): Paragraph {
+    private buildHorizontalRule(secId?: string): Paragraph {
+        const secBm = secId ? [new Bookmark({ id: `sec_${secId}`, children: [new TextRun({ text: '' })] })] : [];
         return new Paragraph({
             spacing: { before: 200, after: 200 },
             border: {
@@ -1140,14 +1443,15 @@ export class DocumentService {
                     space: 1,
                 },
             },
-            children: [],
+            children: secBm as any,
         });
     }
 
     /**
      * Build a blockquote - indented text with a left accent border
      */
-    private buildBlockquote(section: DocumentSection, theme: DocumentTheme): Paragraph {
+    private buildBlockquote(section: DocumentSection, theme: DocumentTheme, secId?: string): Paragraph {
+        const secBm = secId ? [new Bookmark({ id: `sec_${secId}`, children: [new TextRun({ text: '' })] })] : [];
         return new Paragraph({
             spacing: { after: 200, line: 360 },
             indent: { left: 720 },
@@ -1160,6 +1464,7 @@ export class DocumentService {
                 },
             },
             children: [
+                ...secBm,
                 new TextRun({
                     text: stripMarkdown(section.content || ''),
                     italics: true,
@@ -1167,16 +1472,57 @@ export class DocumentService {
                     size: FONT_SIZES.body,
                     color: theme.textColor || '666666',
                 }),
-            ],
+            ] as any,
         });
     }
 
     /**
      * Build a callout box - colored background with border
      */
-    private buildCallout(section: DocumentSection, theme: DocumentTheme): Table {
+    private buildCallout(section: DocumentSection, theme: DocumentTheme, secId?: string): Table {
         const bgColor = section.backgroundColor || theme.accentColor || 'F0F8FF';
         const borderColor = section.borderColor || theme.headingColor || '000000';
+        const rawContent = stripMarkdown(section.content || '');
+
+        let cellParagraphs: Paragraph[] = [];
+
+        if (section.parasRuns && section.parasRuns.length > 0) {
+            cellParagraphs = section.parasRuns.map((pRuns, index) => {
+                const secBm = (secId && index === 0) ? [new Bookmark({ id: `sec_${secId}`, children: [new TextRun({ text: '' })] })] : [];
+                return new Paragraph({
+                    spacing: { before: 60, after: 120, line: 276, lineRule: LineRuleType.AUTO },
+                    children: [
+                        ...secBm,
+                        ...pRuns.map(r => new TextRun({
+                            text: r.text,
+                            font: r.font || theme.fontFamily || 'Arial',
+                            size: r.fontSize || FONT_SIZES.body,
+                            bold: r.bold,
+                            italics: r.italic,
+                            color: r.color || theme.textColor || '333333',
+                            underline: r.underline ? {} : undefined,
+                        })),
+                    ] as any,
+                });
+            });
+        } else {
+            const lines = rawContent.split('\n').map(l => l.trim()).filter(Boolean);
+            cellParagraphs = (lines.length > 0 ? lines : ['']).map((line, index) => {
+                const secBm = (secId && index === 0) ? [new Bookmark({ id: `sec_${secId}`, children: [new TextRun({ text: '' })] })] : [];
+                return new Paragraph({
+                    spacing: { before: 60, after: 120, line: 276, lineRule: LineRuleType.AUTO },
+                    children: [
+                        ...secBm,
+                        new TextRun({
+                            text: line,
+                            font: theme.fontFamily || 'Arial',
+                            size: FONT_SIZES.body,
+                            color: theme.textColor || '333333',
+                        }),
+                    ] as any,
+                });
+            });
+        }
 
         return new Table({
             width: { size: 100, type: WidthType.PERCENTAGE },
@@ -1192,22 +1538,11 @@ export class DocumentService {
                                 right: { style: BorderStyle.SINGLE, size: 4, color: borderColor },
                             },
                             margins: { top: 120, bottom: 120, left: 120, right: 120 },
-                            children: [
-                                new Paragraph({
-                                    children: [
-                                        new TextRun({
-                                            text: stripMarkdown(section.content || ''),
-                                            font: theme.fontFamily || 'Arial',
-                                            size: FONT_SIZES.body,
-                                            color: theme.textColor,
-                                        })
-                                    ]
-                                })
-                            ]
-                        })
-                    ]
-                })
-            ]
+                            children: cellParagraphs,
+                        }),
+                    ],
+                }),
+            ],
         });
     }
 
@@ -1219,7 +1554,8 @@ export class DocumentService {
     private buildSectionBlock(
         section: DocumentSection,
         theme: DocumentTheme,
-        headingInfos: { id: string; text: string; level: number }[]
+        headingInfos: { id: string; text: string; level: number }[],
+        secId?: string
     ): Table {
         const bgColor = section.backgroundColor || 'FFFFFF';
         // Only show borders if AI explicitly set a borderColor
@@ -1233,9 +1569,13 @@ export class DocumentService {
         if (section.sections) {
             children = this.buildSectionChildren(section.sections, theme, headingInfos);
         } else if (section.content) {
+            const secBm = secId ? [new Bookmark({ id: `sec_${secId}`, children: [new TextRun({ text: '' })] })] : [];
             children = [
                 new Paragraph({
-                    children: [new TextRun({ text: stripMarkdown(section.content), font: theme.fontFamily || 'Arial', size: FONT_SIZES.body, color: theme.textColor || '212121' })]
+                    children: [
+                        ...secBm,
+                        new TextRun({ text: stripMarkdown(section.content), font: theme.fontFamily || 'Arial', size: FONT_SIZES.body, color: theme.textColor || '212121' })
+                    ] as any
                 })
             ];
         }

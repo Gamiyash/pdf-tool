@@ -18,11 +18,12 @@ export const getGeminiModel = (): GenerativeModel => {
         }
 
         genAI = new GoogleGenerativeAI(env.GEMINI_API_KEY);
+        const modelName = env.GEMINI_MODEL || 'gemini-2.5-flash';
         model = genAI.getGenerativeModel({
-            model: 'gemini-2.5-flash',
+            model: modelName,
         });
 
-        loggerUtil.info('Gemini AI client initialized', { model: 'gemini-2.5-flash' });
+        loggerUtil.info('Gemini AI client initialized', { model: modelName });
     }
 
     return model;

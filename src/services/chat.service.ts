@@ -1,5 +1,6 @@
 import { SchemaType } from '@google/generative-ai';
 import { getGeminiModel } from '../config/gemini.config';
+import { env } from '../config/env.config';
 import { AppError } from '../middleware/error.middleware';
 import { loggerUtil } from '../utils/logger.util';
 import { ConversationRepository } from '../repositories/conversation.repository';
@@ -208,7 +209,7 @@ export class ChatService {
                     content: aiResponse.reply,
                     intent: aiResponse.intent,
                     metadata: {
-                        model: 'gemini-2.5-flash',
+                        model: env.GEMINI_MODEL || 'gemini-2.5-flash',
                         responseTimeMs,
                         promptTokens: usageMetadata?.promptTokenCount,
                         completionTokens: usageMetadata?.candidatesTokenCount,

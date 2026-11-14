@@ -61,7 +61,10 @@ export interface DocumentSection {
     level?: number;             // For headings: 1, 2, or 3
     content?: string;           // For heading/paragraph/blockquote/callout text
     textRuns?: TextRunData[];   // For rich text paragraphs
-    items?: string[];           // For bullet_list/numbered_list
+    titleRuns?: TextRunData[];  // For heading/references section title
+    items?: string[];           // For bullet_list/numbered_list/references
+    itemRuns?: TextRunData[][]; // For rich-text bullet_list/numbered_list/references items
+    parasRuns?: TextRunData[][];// For multi-paragraph callout or blockquote sections
     rows?: TableRowData[];      // For tables
     columnWidths?: number[];    // For tables (DXA units)
     pageBreakBefore?: boolean;  // Insert page break before this section
@@ -109,11 +112,17 @@ export interface DocumentStructure {
     };
     headerFooter?: {
         headerLeft?: string;
+        headerLeftRuns?: TextRunData[];
         headerCenter?: string;
+        headerCenterRuns?: TextRunData[];
         headerRight?: string;
+        headerRightRuns?: TextRunData[];
         footerLeft?: string;
+        footerLeftRuns?: TextRunData[];
         footerCenter?: string;
+        footerCenterRuns?: TextRunData[];
         footerRight?: string; // e.g. "Page {page}" or just text
+        footerRightRuns?: TextRunData[];
     };
 }
 

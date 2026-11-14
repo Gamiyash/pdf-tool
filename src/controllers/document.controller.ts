@@ -10,6 +10,7 @@ import { GenerateDocRequest, DocumentSection, DocumentStructure } from '../types
 import { AuthRequest } from './chat.controller';
 import { ConversationRepository } from '../repositories/conversation.repository';
 import { MessageRepository } from '../repositories/message.repository';
+import { extractSectionsFromDocx } from '../services/docx-parser.service';
 
 /**
  * Document Controller
@@ -411,5 +412,498 @@ export class DocumentController {
 
         loggerUtil.info('Document re-downloaded successfully', { conversationId, version: targetVersion, fileName, fileSize: buffer.length });
         res.send(buffer);
+    });
+
+    /**
+     * Save user edits from the browser editor by parsing the DOCX binary.
+     * Extracts section content using our embedded section bookmarks.
+     * Updates only changed sections in the current version — NO new version created.
+     * POST /api/document/conversations/:conversationId/save-edits?version=N
+     */
+    saveUserEdits = asyncHandler(async (req: AuthRequest, res: Response) => {
+        const { conversationId } = req.params;
+        const versionParam = req.query.version as string;
+        const userId = req.userId!;
+
+        const conv = await this.conversationRepo.findByIdAndUser(conversationId, userId);
+        if (!conv?.document?.versions?.length) {
+            throw new AppError(404, 'Document not found for this conversation');
+        }
+
+        // Determine target version
+        const targetVersion = versionParam
+            ? parseInt(versionParam, 10)
+            : conv.document.currentVersion;
+
+        const versionData = conv.document.versions.find(v => v.version === targetVersion);
+        if (!versionData) throw new AppError(404, `Version v${targetVersion} not found`);
+
+        const buffer = req.body as Buffer;
+        if (!buffer || buffer.length === 0) {
+            throw new AppError(400, 'Request body must be a non-empty DOCX binary');
+        }
+
+        // Parse the DOCX binary
+        const parsed = await extractSectionsFromDocx(buffer);
+        const structure = versionData.structure as DocumentStructure;
+        let changedSections = 0;
+
+        // ── DIAGNOSTIC: Log what the parser found vs what the JSON structure has ──
+        const structureSectionIds: string[] = [];
+        const collectIds = (sections: DocumentSection[]) => {
+            for (const s of sections) {
+                if (s.id) structureSectionIds.push(s.id);
+                if (s.sections) collectIds(s.sections);
+            }
+        };
+        collectIds(structure.sections);
+
+        loggerUtil.info('[CONTROLLER] === SAVE-EDITS DIAGNOSTIC ===', {
+            conversationId,
+            targetVersion,
+            structureSectionCount: structureSectionIds.length,
+            parsedSectionCount: parsed.sections.size,
+            matchedIds: structureSectionIds.filter(id => parsed.sections.has(id)),
+            unmatchedStructureIds: structureSectionIds.filter(id => !parsed.sections.has(id)),
+            extraParsedIds: [...parsed.sections.keys()].filter(id => !structureSectionIds.includes(id)),
+            orphanBlockCount: parsed.orphanBlocks.length,
+            orphanContentLines: parsed.orphanContent.length,
+            orphanPreviews: parsed.orphanBlocks.map(b => ({
+                lines: b.lines.map(l => l.substring(0, 60)),
+                beforeId: b.beforeSectionId,
+                afterId: b.afterSectionId,
+            })),
+        });
+
+        // Quick helper to strip markdown to safely compare raw text
+        const stripMarkdown = (text: string) => {
+            return text.replace(/(\*\*|__)(.*?)\1/g, '$2').replace(/(\*|_)(.*?)\1/g, '$2').replace(/#/g, '').trim();
+        };
+
+        // ── Update section-level content ───────────────────────────────────────────
+        const updateSectionsRecursive = (sections: DocumentSection[]) => {
+            for (const section of sections) {
+                if (!section.id) continue;
+                const extracted = parsed.sections.get(section.id);
+
+                if (!extracted) {
+                    loggerUtil.info('[CONTROLLER] Section NOT matched in parsed DOCX (bookmark missing?)', {
+                        sectionId: section.id,
+                        sectionType: section.type,
+                        contentPreview: (section.content || '').substring(0, 80),
+                    });
+                }
+
+                if (extracted) {
+                    loggerUtil.info('[CONTROLLER] Section MATCHED', {
+                        sectionId: section.id,
+                        sectionType: section.type,
+                        origContentPreview: (section.content || '').substring(0, 80),
+                        extractedContentPreview: (extracted.content || '').substring(0, 80),
+                    });
+                    // Type morphing: Auto-change type if user replaced a paragraph with a table in Word
+                    if (extracted.rows && extracted.rows.length > 0 && (!extracted.content || extracted.content.trim() === '')) {
+                        if (section.type !== 'table') {
+                            section.type = 'table';
+                            if (!section.rows) section.rows = [];
+                            delete section.content;
+                            changedSections++;
+                        }
+                    }
+                    // Type morphing: Auto-change type if user deleted a table and wrote text
+                    if (extracted.content && extracted.content.trim() !== '' && (!extracted.rows || extracted.rows.length === 0)) {
+                        if (section.type === 'table') {
+                            section.type = 'paragraph';
+                            delete section.rows;
+                            changedSections++;
+                        }
+                    }
+
+                    if (section.type === 'table') {
+                        if (extracted.rows) {
+                            let tableChanged = false;
+
+                            const newRows = extracted.rows.map((extRow, r) => {
+                                const origRow = section.rows?.[r];
+                                return {
+                                    isHeader: origRow ? origRow.isHeader : r === 0,
+                                    cells: (extRow.cells || []).map((extCell, c) => {
+                                        const origCell = origRow?.cells[c];
+                                        const oPlain = origCell ? stripMarkdown(origCell.text || '') : '';
+                                        const ePlain = (extCell.text || '').trim();
+
+                                        if (origCell && oPlain === ePlain) {
+                                            return origCell; // Preserve formatting completely if text matches
+                                        }
+
+                                        tableChanged = true;
+                                        return {
+                                            ...(origCell || {}),
+                                            text: ePlain
+                                        };
+                                    })
+                                };
+                            });
+
+                            if (section.rows?.length !== newRows.length || tableChanged) {
+                                section.rows = newRows as any;
+                                changedSections++;
+                            }
+                        }
+                    } else if (section.type === 'bullet_list' || section.type === 'numbered_list') {
+                        const newItemsPlain = (extracted.content || '').split('\n').map(i => i.trim()).filter(Boolean);
+                        let listChanged = false;
+
+                        const mergedItems = newItemsPlain.map((extItem, index) => {
+                            const origItem = (section.items || [])[index];
+                            if (origItem && stripMarkdown(origItem) === extItem) {
+                                return origItem; // Preserve formatting completely if text matches
+                            }
+                            listChanged = true;
+                            return extItem;
+                        });
+
+                        if (section.items?.length !== newItemsPlain.length || listChanged) {
+                            section.items = mergedItems;
+                            changedSections++;
+                        }
+                        delete section.textRuns;
+                        if (extracted.parasRuns && extracted.parasRuns.length > 0) {
+                            section.itemRuns = extracted.parasRuns;
+                        }
+                    } else if (section.type === 'references') {
+                        const lines = (extracted.content || '').split('\n').map(l => l.trim()).filter(Boolean);
+                        if (lines.length > 0) {
+                            let newTitle = 'References';
+                            let extItems: string[] = [];
+
+                            if (lines[0].toLowerCase().includes('reference')) {
+                                newTitle = lines[0];
+                                extItems = lines.slice(1);
+                                if (extracted.parasRuns && extracted.parasRuns.length > 0) {
+                                    section.titleRuns = extracted.parasRuns[0];
+                                    section.itemRuns = extracted.parasRuns.slice(1);
+                                }
+                            } else {
+                                extItems = lines;
+                                if (extracted.parasRuns && extracted.parasRuns.length > 0) {
+                                    section.itemRuns = extracted.parasRuns;
+                                }
+                            }
+
+                            if (extItems.length > 0) {
+                                section.items = extItems;
+                            }
+                            section.content = newTitle;
+                            delete section.textRuns;
+                            changedSections++;
+                        }
+                    } else if (section.type === 'callout') {
+                        let extText = (extracted.content || '').trim();
+                        if (!extText && extracted.rows && extracted.rows.length > 0) {
+                            extText = extracted.rows.flatMap(r => r.cells.map(c => c.text)).join('\n').trim();
+                        }
+                        if (extText) {
+                            const origPlain = stripMarkdown(section.content || '');
+                            if (origPlain !== extText) {
+                                section.content = extText;
+                                changedSections++;
+                            }
+                        }
+                        delete section.textRuns;
+                        if (extracted.parasRuns && extracted.parasRuns.length > 0) {
+                            section.parasRuns = extracted.parasRuns;
+                        }
+                    } else if (section.type === 'heading') {
+                        // Headings have a single title line. Only extract line 0 to prevent paragraph text from merging into heading
+                        const extLines = (extracted.content || '').split('\n').map(l => l.trim()).filter(Boolean);
+                        const extHeadingText = extLines[0] || (extracted.content || '').trim();
+                        const origHeadingText = stripMarkdown(section.content || '');
+
+                        let headingChanged = false;
+                        if (extHeadingText && origHeadingText !== extHeadingText) {
+                            section.content = extHeadingText;
+                            headingChanged = true;
+                        }
+
+                        if (extracted.textRuns && extracted.textRuns.length > 0) {
+                            const textRunsCombined = extracted.textRuns.map(r => r.text).join('').trim();
+                            if (textRunsCombined === extHeadingText || textRunsCombined === origHeadingText) {
+                                if (JSON.stringify(section.textRuns) !== JSON.stringify(extracted.textRuns)) {
+                                    section.textRuns = extracted.textRuns as any;
+                                    headingChanged = true;
+                                }
+                            } else {
+                                delete section.textRuns;
+                            }
+                        }
+
+                        if (headingChanged) {
+                            changedSections++;
+                        }
+                    } else {
+                        const origPlain = stripMarkdown(section.content || (section.textRuns || []).map(r => r.text).join('') || '');
+                        const extPlain = (extracted.content || '').trim();
+
+                        let sectionUpdated = false;
+
+                        if (origPlain !== extPlain) {
+                            section.content = extPlain;
+                            sectionUpdated = true;
+                        }
+
+                        if (extracted.textRuns && JSON.stringify(section.textRuns) !== JSON.stringify(extracted.textRuns)) {
+                            section.textRuns = extracted.textRuns as any;
+                            sectionUpdated = true;
+                        }
+
+                        if (extracted.parasRuns && extracted.parasRuns.length > 1) {
+                            if (JSON.stringify(section.parasRuns) !== JSON.stringify(extracted.parasRuns)) {
+                                section.parasRuns = extracted.parasRuns as any;
+                                sectionUpdated = true;
+                            }
+                        } else if (section.parasRuns) {
+                            delete section.parasRuns;
+                            sectionUpdated = true;
+                        }
+
+                        if (sectionUpdated) {
+                            changedSections++;
+                        }
+                    }
+                }
+
+                // Recurse into nested sections (two_column etc.)
+                if (section.sections) updateSectionsRecursive(section.sections);
+            }
+        };
+
+        updateSectionsRecursive(structure.sections);
+
+        // ── Reorder sections if user moved them ─────────────────────────────────
+        // (Only applies to top-level sections for now)
+        const currentOrder = structure.sections.map(s => s.id).filter(Boolean) as string[];
+        const newOrder = parsed.sectionOrder;
+
+        // Determine if relative order of sections actually changed
+        let orderChanged = false;
+        if (newOrder.length > 0) {
+            const currentOrderFiltered = currentOrder.filter(id => newOrder.includes(id));
+            const newOrderFiltered = newOrder.filter(id => currentOrder.includes(id));
+            if (JSON.stringify(currentOrderFiltered) !== JSON.stringify(newOrderFiltered)) {
+                orderChanged = true;
+            }
+        }
+
+        if (orderChanged) {
+            const sectionMap = new Map(structure.sections.map(s => [s.id!, s]));
+            const reordered = newOrder.map(id => sectionMap.get(id)).filter(Boolean) as DocumentSection[];
+
+            // Preserve any un-bookmarked / missing sections at their original relative positions
+            const missingSections = structure.sections.filter(s => s.id && !newOrder.includes(s.id));
+
+            for (const missing of missingSections) {
+                const origIndex = structure.sections.findIndex(s => s.id === missing.id);
+                let insertIndex = -1;
+                // Find nearest previous section in original structure that is in reordered
+                for (let i = origIndex - 1; i >= 0; i--) {
+                    const prevId = structure.sections[i].id;
+                    const pos = reordered.findIndex(s => s.id === prevId);
+                    if (pos !== -1) {
+                        insertIndex = pos + 1;
+                        break;
+                    }
+                }
+
+                if (insertIndex !== -1) {
+                    reordered.splice(insertIndex, 0, missing);
+                } else {
+                    // Try finding nearest next section
+                    let nextInsertIndex = -1;
+                    for (let i = origIndex + 1; i < structure.sections.length; i++) {
+                        const nextId = structure.sections[i].id;
+                        const pos = reordered.findIndex(s => s.id === nextId);
+                        if (pos !== -1) {
+                            nextInsertIndex = pos;
+                            break;
+                        }
+                    }
+                    if (nextInsertIndex !== -1) {
+                        reordered.splice(nextInsertIndex, 0, missing);
+                    } else {
+                        reordered.push(missing);
+                    }
+                }
+            }
+
+            structure.sections = reordered;
+
+            loggerUtil.info('Section order updated from user edit', { conversationId, newOrder });
+        }
+
+        // ── Update document-level fields ─────────────────────────────────────────
+        const dl = parsed.documentLevel;
+        let docLevelChanged = false;
+
+        if (dl.margins && JSON.stringify(dl.margins) !== JSON.stringify(structure.margins)) {
+            structure.margins = dl.margins;
+            docLevelChanged = true;
+        }
+
+        if (dl.pageSize && JSON.stringify(dl.pageSize) !== JSON.stringify(structure.pageSize)) {
+            structure.pageSize = dl.pageSize;
+            docLevelChanged = true;
+        }
+
+        if (dl.headerLeft !== undefined || dl.headerCenter !== undefined || dl.headerRight !== undefined ||
+            dl.footerLeft !== undefined || dl.footerCenter !== undefined || dl.footerRight !== undefined) {
+
+            const currentHF = structure.headerFooter || {};
+            const newHF = {
+                ...currentHF,
+                ...(dl.headerLeft !== undefined && { headerLeft: dl.headerLeft }),
+                ...(dl.headerLeftRuns !== undefined && { headerLeftRuns: dl.headerLeftRuns }),
+                ...(dl.headerCenter !== undefined && { headerCenter: dl.headerCenter }),
+                ...(dl.headerCenterRuns !== undefined && { headerCenterRuns: dl.headerCenterRuns }),
+                ...(dl.headerRight !== undefined && { headerRight: dl.headerRight }),
+                ...(dl.headerRightRuns !== undefined && { headerRightRuns: dl.headerRightRuns }),
+                ...(dl.footerLeft !== undefined && { footerLeft: dl.footerLeft }),
+                ...(dl.footerLeftRuns !== undefined && { footerLeftRuns: dl.footerLeftRuns }),
+                ...(dl.footerCenter !== undefined && { footerCenter: dl.footerCenter }),
+                ...(dl.footerCenterRuns !== undefined && { footerCenterRuns: dl.footerCenterRuns }),
+                ...(dl.footerRight !== undefined && { footerRight: dl.footerRight }),
+                ...(dl.footerRightRuns !== undefined && { footerRightRuns: dl.footerRightRuns }),
+            };
+
+            if (JSON.stringify(currentHF) !== JSON.stringify(newHF)) {
+                structure.headerFooter = newHF;
+                docLevelChanged = true;
+            }
+        }
+
+        // ── Handle new orphan content (user added text outside any bookmark) ─────────
+        // If the frontend editor changes formatting (color, font, bold) it may strip embedded
+        // bookmarks. In that case, section text appears as orphan content even though it already
+        // exists in structure.sections. We must deduplicate before inserting.
+        //
+        // Strategy: compare orphan line text against ALL existing section content.
+        // If the text already exists (exact or substring), skip inserting it.
+        const normalize = (s: string) => s.replace(/\s+/g, ' ').trim().toLowerCase();
+        const existingSectionTexts = new Set<string>();
+        // Also keep raw normalized content for substring checks
+        const existingSectionFullTexts: string[] = [];
+        const collectSectionTexts = (sections: DocumentSection[]) => {
+            for (const s of sections) {
+                if (s.content) {
+                    const n = normalize(s.content);
+                    existingSectionTexts.add(n);
+                    existingSectionFullTexts.push(n);
+                }
+                if (s.sections) collectSectionTexts(s.sections);
+                if (s.items) s.items.forEach(i => existingSectionTexts.add(normalize(i)));
+            }
+        };
+        collectSectionTexts(structure.sections);
+
+        // Helper: check if orphan text is already contained somewhere in existing sections
+        const isOrphanDuplicate = (orphanText: string): boolean => {
+            const n = normalize(orphanText);
+            if (!n || n.length < 6) return true; // Skip empty/tiny
+            // Exact match
+            if (existingSectionTexts.has(n)) return true;
+            // Substring match: orphan line is part of an existing section's content
+            for (const fullText of existingSectionFullTexts) {
+                if (fullText.includes(n)) return true;
+            }
+            return false;
+        };
+
+        if (parsed.orphanBlocks.length > 0) {
+            // If most sections lost their bookmarks, the editor stripped them.
+            // In this case orphan content is NOT new user text — it's existing content
+            // that lost its bookmark. Skip ALL orphan insertion to prevent duplication.
+            const orphanRate = parsed.orphanBlocks.reduce((n, b) => n + b.lines.filter(t => t.trim()).length, 0);
+            const matchedCount = parsed.sections.size;
+            const existingCount = structure.sections.length;
+            const unmatchedCount = existingCount - matchedCount;
+
+            if (unmatchedCount > existingCount * 0.5) {
+                // More than half of sections lost bookmarks — editor stripped them en masse
+                loggerUtil.warn('[CONTROLLER] Majority of section bookmarks stripped by editor. Skipping ALL orphan insertion to prevent duplication.', {
+                    orphanRate,
+                    matchedCount,
+                    existingCount,
+                    unmatchedCount,
+                });
+            } else {
+                for (const block of parsed.orphanBlocks) {
+                    const newSections = block.lines
+                        .filter(t => !isOrphanDuplicate(t))
+                        .map(text => ({
+                            id: randomUUID(),
+                            type: 'paragraph' as const,
+                            content: text,
+                            textRuns: [{
+                                text,
+                                fontSize: 22,
+                                font: structure.theme?.fontFamily || 'Arial',
+                                color: structure.theme?.textColor || '333333',
+                            }]
+                        }));
+
+                    if (newSections.length > 0) {
+                        loggerUtil.info('[CONTROLLER] Inserting genuinely new orphan sections', {
+                            count: newSections.length,
+                            previews: newSections.map(s => s.content.substring(0, 60)),
+                            beforeId: block.beforeSectionId,
+                            afterId: block.afterSectionId,
+                        });
+                    }
+
+                    if (newSections.length === 0) continue;
+
+                    if (block.beforeSectionId) {
+                        const idx = structure.sections.findIndex(s => s.id === block.beforeSectionId);
+                        if (idx !== -1) {
+                            structure.sections.splice(idx + 1, 0, ...newSections);
+                            continue;
+                        }
+                    }
+
+                    if (block.afterSectionId) {
+                        const idx = structure.sections.findIndex(s => s.id === block.afterSectionId);
+                        if (idx !== -1) {
+                            structure.sections.splice(idx, 0, ...newSections);
+                            continue;
+                        }
+                    }
+
+                    // Fallback: append to end (never prepend to top)
+                    structure.sections.push(...newSections);
+                }
+            }
+        }
+
+        // ── Persist ─────────────────────────────────────────────────────────
+        if (changedSections > 0 || orderChanged || parsed.orphanBlocks.length > 0 || docLevelChanged) {
+            await this.conversationRepo.updateDocumentVersion(conversationId, targetVersion, structure);
+        }
+
+        loggerUtil.info('User edits saved', {
+            conversationId,
+            version: targetVersion,
+            changedSections,
+            orderChanged,
+            docLevelChanged,
+            orphanAdded: parsed.orphanContent.length,
+        });
+
+        res.status(200).json({
+            success: true,
+            message: 'Edits saved successfully',
+            changedSections,
+            orderChanged,
+            docLevelChanged,
+        });
     });
 }

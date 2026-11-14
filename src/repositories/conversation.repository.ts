@@ -194,4 +194,21 @@ export class ConversationRepository {
         const result = await Conversation.findByIdAndDelete(id).exec();
         return !!result;
     }
+
+    /**
+     * Update the structure of an existing document version in-place.
+     * Used when user edits are parsed and applied — no new version is created.
+     */
+    async updateDocumentVersion(
+        conversationId: string,
+        version: number,
+        structure: object
+    ): Promise<void> {
+        await Conversation.updateOne(
+            { _id: conversationId, 'document.versions.version': version },
+            { $set: { 'document.versions.$.structure': structure } }
+        ).exec();
+        loggerUtil.info('Document version updated in-place', { conversationId, version });
+    }
 }
+

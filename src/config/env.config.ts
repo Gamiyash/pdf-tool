@@ -29,6 +29,7 @@ interface EnvConfig {
 
     // Gemini AI
     GEMINI_API_KEY: string;
+    GEMINI_MODEL: string;
 
     // Google Auth
     GOOGLE_CLIENT_ID: string;
@@ -61,6 +62,7 @@ const getEnvConfig = (): EnvConfig => {
 
         // Gemini AI
         GEMINI_API_KEY: process.env.GEMINI_API_KEY || '',
+        GEMINI_MODEL: process.env.GEMINI_MODEL || 'gemini-2.5-flash',
 
         // Google Auth
         GOOGLE_CLIENT_ID: process.env.GOOGLE_CLIENT_ID || '',
